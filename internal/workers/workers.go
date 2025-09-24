@@ -12,6 +12,7 @@ import (
 )
 
 type fileID string
+type fileStatus int
 type taskID string
 type taskStatus int
 
@@ -21,35 +22,47 @@ const (
 	task
 )
 
+const (
+	fileAwait fileStatus = iota
+	fileDownloaded
+	fileDone
+	fileFailured
+)
+
 type WorkerPool struct {
 	taskQueue chan TaskModel
+	taskCount uint32
+	Directory string `json:"directory"`
 
 	wgWorkers sync.WaitGroup
 	wgTasks   sync.WaitGroup
+
+	mu sync.Mutex
 }
 
 type TaskModel struct {
 	ID        taskID      `json:"id"`
 	Status    taskStatus  `json:"status"`
 	Files     []FileModel `json:"file"`
-	Directory string      `json:"directory"`
 	CreatedAt time.Time   `json:"created_at"`
 	UpdatedAt time.Time   `json:"updated_at"`
 }
 
 type FileModel struct {
-	ID        fileID `json:"id"`
-	URL       string `json:"url"`
-	Filename  string `json:"filename"`
-	Status    string `json:"status"`
-	Error     string `json:"error,omitempty"`
-	UpdatedAt string `json:"updated_at"`
+	ID        fileID     `json:"id"`
+	URL       string     `json:"url"`
+	Filename  string     `json:"filename"`
+	Status    fileStatus `json:"status"`
+	Error     string     `json:"error,omitempty"`
+	UpdatedAt string     `json:"updated_at"`
 }
 
 func NewWorkerPool(workerCount uint16) *WorkerPool {
 	wp := &WorkerPool{
 		taskQueue: make(chan TaskModel, 1024),
 	}
+
+	// проверка, есть ли сохраненный счетчик задач в бд, если нет taskCount = 0
 
 	// добавление в очередь неоконченных задач из бд
 	// добавление в очередь ожидающих задач из бд
@@ -70,7 +83,7 @@ func (wp *WorkerPool) worker() {
 	}
 
 	for _, val := range localTask.Files {
-		err := downloadFile(string(localTask.ID), localTask.Directory, &val) // проверить передается ли ссылка на изначальный объект
+		err := downloadFile(string(localTask.ID), wp.Directory, &val) // проверить передается ли ссылка на изначальный объект
 		if err != nil {
 			// сообщение об ошибке статус файла на filed, занесение в бд
 		}
@@ -139,5 +152,33 @@ func detectFilename(url string, resp *http.Response) string {
 }
 
 // добавить функцию для добавления таски в очередь. возвращает id задачи
+func (wp *WorkerPool) AddTask(urls []string) string {
+	wp.mu.Lock()
+	wp.taskCount++
+	wp.mu.Unlock()
 
-// функция для просмотра статуса по задаче
+	NewTask := &TaskModel{
+		ID:        taskID(wp.taskCount), // подкорректировать конвертацию в taskID
+		Status:    taskAwait,
+		Files:     make([]FileModel, len(urls)),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	for idx, url := range urls {
+		NewTask.Files[idx] = FileModel{
+			ID:        fileID(idx),
+			URL:       url,
+			Filename:  "",
+			Status:    fileAwait,
+			Error:     "",
+			UpdatedAt: "",
+		}
+	}
+
+	wp.taskQueue <- *NewTask
+
+	return string(NewTask.ID)
+}
+
+// функция для просмотра статуса по задаче, требуется бд
