@@ -3,7 +3,10 @@ package workers
 import (
 	"fmt"
 	"gotest/internal/config"
+	"gotest/internal/database"
+	wm "gotest/internal/workerModels"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -15,26 +18,8 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-type fileID string
-type fileStatus int
-type taskID string
-type taskStatus int
-
-const (
-	taskAwait taskStatus = iota
-	taskInProgress
-	task
-)
-
-const (
-	fileAwait fileStatus = iota
-	fileDownloaded
-	fileDone
-	fileFailured
-)
-
 type WorkerPool struct {
-	taskQueue        chan TaskModel
+	taskQueue        chan wm.TaskModel
 	taskCount        uint32
 	storageDirectory string
 
@@ -46,28 +31,11 @@ type WorkerPool struct {
 	mu sync.Mutex
 }
 
-type TaskModel struct {
-	ID        taskID      `json:"id"`
-	Status    taskStatus  `json:"status"`
-	Files     []FileModel `json:"file"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
-}
-
-type FileModel struct {
-	ID        fileID     `json:"id"`
-	URL       string     `json:"url"`
-	Filename  string     `json:"filename"`
-	Status    fileStatus `json:"status"`
-	Error     string     `json:"error,omitempty"`
-	UpdatedAt string     `json:"updated_at"`
-}
-
-func NewWorkerPool(cfg *config.Config, db *bbolt.DB) *WorkerPool {
+func NewWorkerPool(cfg *config.Config, database *database.Database) *WorkerPool {
 	wp := &WorkerPool{
-		taskQueue:        make(chan TaskModel, 1024),
+		taskQueue:        make(chan wm.TaskModel, 1024),
 		storageDirectory: cfg.Service.StorageDir,
-		db:               db,
+		db:               database.DB,
 		taskCount:        0,
 		mu:               sync.Mutex{},
 		wgWorkers:        sync.WaitGroup{},
@@ -75,11 +43,31 @@ func NewWorkerPool(cfg *config.Config, db *bbolt.DB) *WorkerPool {
 	}
 
 	workerCount := cfg.Service.WorkerCount
+	taskCount, err := database.GetTaskCount()
+	if err != nil {
+		slog.Error("failed to get task count from database",
+			slog.String("error", err.Error()))
+		taskCount = 0
+	}
+	wp.taskCount = taskCount
 
-	// проверка, есть ли сохраненный счетчик задач в бд, если нет taskCount = 0
+	progressTaskQueue, err := database.GetInProgressTasks() // помещенение в очередь незавершенных задач
+	if err != nil {
+		slog.Error("failed to get in-progress tasks from database",
+			slog.String("error", err.Error()))
+	}
+	for _, task := range progressTaskQueue {
+		wp.taskQueue <- task
+	}
 
-	// добавление в очередь неоконченных задач из бд
-	// добавление в очередь ожидающих задач из бд
+	awaitTaskQueue, err := database.GetAwaitTasks() // помещение в очередь ожидающих задач
+	if err != nil {
+		slog.Error("failed to get await tasks from database",
+			slog.String("error", err.Error()))
+	}
+	for _, task := range awaitTaskQueue {
+		wp.taskQueue <- task
+	}
 
 	for i := uint16(0); i < workerCount; i++ {
 		wp.wgWorkers.Add(1)
@@ -89,25 +77,26 @@ func NewWorkerPool(cfg *config.Config, db *bbolt.DB) *WorkerPool {
 	return wp
 }
 
+// добаотать воркер, мб добавить горутины на каждый файл
 func (wp *WorkerPool) worker() {
 	wp.wgTasks.Add(1)
 	localTask := <-wp.taskQueue
-	if localTask.Status == taskAwait {
-		localTask.Status = taskInProgress
+	if localTask.Status == wm.TaskAwait {
+		localTask.Status = wm.TaskInProgress
 	}
 
-	for _, val := range localTask.Files {
-		err := downloadFile(string(localTask.ID), wp.storageDirectory, &val) // проверить передается ли ссылка на изначальный объект
+	for idx := range localTask.Files {
+		err := downloadFile(string(localTask.ID), wp.storageDirectory, &localTask.Files[idx])
 		if err != nil {
-			// сообщение об ошибке статус файла на filed, занесение в бд
+			// сообщение об ошибке статус файла на failured, занесение в бд
 		}
 		// смена статуса файла, занесение в бд
 	}
 }
 
-// получить ID таски и файл
-func downloadFile(TaskID, dir string, FModel *FileModel) error {
-	resp, err := http.Get(FModel.URL)
+// добавить доозагрузку файлов
+func downloadFile(taskID, dir string, fModel *wm.FileModel) error {
+	resp, err := http.Get(fModel.URL)
 	if err != nil {
 		return fmt.Errorf("url request error: %w", err)
 	}
@@ -116,13 +105,13 @@ func downloadFile(TaskID, dir string, FModel *FileModel) error {
 		return fmt.Errorf("url response error")
 	}
 
-	fileDir := filepath.Join(dir, TaskID)
+	fileDir := filepath.Join(dir, taskID)
 	if err := os.MkdirAll(fileDir, 0755); err != nil {
 		return fmt.Errorf("failed to make directory: %w", err)
 	}
 
-	urlfName := detectFilename(FModel.URL, resp)
-	filename := TaskID + "-" + string(FModel.ID) + "-" + urlfName
+	urlfName := detectFilename(fModel.URL, resp)
+	filename := taskID + "-" + string(fModel.ID) + "-" + urlfName
 
 	filePath := filepath.Join(fileDir, filename)
 
@@ -139,7 +128,7 @@ func downloadFile(TaskID, dir string, FModel *FileModel) error {
 	// добавить попытку переподключиться
 
 	// в конце добавляем имя в структуру для корректного сохранения в бд
-	FModel.Filename = filename
+	fModel.Filename = filename
 	return nil
 }
 
@@ -172,20 +161,20 @@ func (wp *WorkerPool) AddTask(urls []string) string {
 	wp.taskCount++
 	wp.mu.Unlock()
 
-	NewTask := &TaskModel{
-		ID:        taskID(strconv.Itoa(int(wp.taskCount))), // уделить внимание
-		Status:    taskAwait,
-		Files:     make([]FileModel, len(urls)),
+	NewTask := &wm.TaskModel{
+		ID:        wm.TaskID(strconv.Itoa(int(wp.taskCount))), // уделить внимание
+		Status:    wm.TaskAwait,
+		Files:     make([]wm.FileModel, len(urls)),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
 
 	for idx, url := range urls {
-		NewTask.Files[idx] = FileModel{
-			ID:        fileID(strconv.Itoa(idx)),
+		NewTask.Files[idx] = wm.FileModel{
+			ID:        wm.FileID(strconv.Itoa(idx)),
 			URL:       url,
 			Filename:  "",
-			Status:    fileAwait,
+			Status:    wm.FileAwait,
 			Error:     "",
 			UpdatedAt: "",
 		}
