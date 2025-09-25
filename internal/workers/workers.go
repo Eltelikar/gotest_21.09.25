@@ -2,13 +2,17 @@ package workers
 
 import (
 	"fmt"
+	"gotest/internal/config"
 	"io"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
+
+	"go.etcd.io/bbolt"
 )
 
 type fileID string
@@ -30,9 +34,11 @@ const (
 )
 
 type WorkerPool struct {
-	taskQueue chan TaskModel
-	taskCount uint32
-	Directory string `json:"directory"`
+	taskQueue        chan TaskModel
+	taskCount        uint32
+	storageDirectory string
+
+	db *bbolt.DB
 
 	wgWorkers sync.WaitGroup
 	wgTasks   sync.WaitGroup
@@ -57,10 +63,18 @@ type FileModel struct {
 	UpdatedAt string     `json:"updated_at"`
 }
 
-func NewWorkerPool(workerCount uint16) *WorkerPool {
+func NewWorkerPool(cfg *config.Config, db *bbolt.DB) *WorkerPool {
 	wp := &WorkerPool{
-		taskQueue: make(chan TaskModel, 1024),
+		taskQueue:        make(chan TaskModel, 1024),
+		storageDirectory: cfg.Service.StorageDir,
+		db:               db,
+		taskCount:        0,
+		mu:               sync.Mutex{},
+		wgWorkers:        sync.WaitGroup{},
+		wgTasks:          sync.WaitGroup{},
 	}
+
+	workerCount := cfg.Service.WorkerCount
 
 	// проверка, есть ли сохраненный счетчик задач в бд, если нет taskCount = 0
 
@@ -83,7 +97,7 @@ func (wp *WorkerPool) worker() {
 	}
 
 	for _, val := range localTask.Files {
-		err := downloadFile(string(localTask.ID), wp.Directory, &val) // проверить передается ли ссылка на изначальный объект
+		err := downloadFile(string(localTask.ID), wp.storageDirectory, &val) // проверить передается ли ссылка на изначальный объект
 		if err != nil {
 			// сообщение об ошибке статус файла на filed, занесение в бд
 		}
@@ -124,11 +138,12 @@ func downloadFile(TaskID, dir string, FModel *FileModel) error {
 	}
 	// добавить попытку переподключиться
 
-	// в конце добавляем имя
+	// в конце добавляем имя в структуру для корректного сохранения в бд
 	FModel.Filename = filename
 	return nil
 }
 
+// функция для определения имени файла
 func detectFilename(url string, resp *http.Response) string {
 	if cd := resp.Header.Get("Content-Disposition"); cd != "" { // Проверяем Content-Disposition
 		if _, params, err := mime.ParseMediaType(cd); err == nil {
@@ -151,14 +166,14 @@ func detectFilename(url string, resp *http.Response) string {
 	return "downloaded.bin"
 }
 
-// добавить функцию для добавления таски в очередь. возвращает id задачи
+// функция для добавления задачи в очередь, возвращает ID задачи
 func (wp *WorkerPool) AddTask(urls []string) string {
 	wp.mu.Lock()
 	wp.taskCount++
 	wp.mu.Unlock()
 
 	NewTask := &TaskModel{
-		ID:        taskID(wp.taskCount), // подкорректировать конвертацию в taskID
+		ID:        taskID(strconv.Itoa(int(wp.taskCount))), // уделить внимание
 		Status:    taskAwait,
 		Files:     make([]FileModel, len(urls)),
 		CreatedAt: time.Now(),
@@ -167,7 +182,7 @@ func (wp *WorkerPool) AddTask(urls []string) string {
 
 	for idx, url := range urls {
 		NewTask.Files[idx] = FileModel{
-			ID:        fileID(idx),
+			ID:        fileID(strconv.Itoa(idx)),
 			URL:       url,
 			Filename:  "",
 			Status:    fileAwait,

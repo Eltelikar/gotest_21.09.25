@@ -20,7 +20,7 @@ type Service struct {
 	WorkerCount uint16 `yaml:"worker_count" env-default:"4"`
 	FilesAtTime uint16 `yaml:"files_at_time" env-default:"20"`
 	StorageDir  string `yaml:"storage_dir" env-default:"storage/"`
-	DbDir       string `yaml:"db_dir" env-default:"database/"`
+	DbPath      string `yaml:"db_path" env-default:"database/savedTasks.db"`
 }
 
 type HTTPServer struct {

@@ -3,7 +3,7 @@ service:
   worker_count: "4"
   files_at_time: "20"
   storage_dir: "storage/"
-  db_dir: "database/"
+  db_path: "database/"
 http-server:
   address: ":8080"
   timeout: "4s"
